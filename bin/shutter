@@ -88,6 +88,7 @@ use File::Temp qw/ tempfile tempdir /;
 use File::Spec;
 use File::Which;
 use File::Copy::Recursive;
+use File::Path qw/ make_path /;
 use IO::File();
 
 #A selection of general-utility list subroutines
@@ -358,6 +359,9 @@ my $save_ask_active;
 my $save_auto_active;
 my $save_no_active;
 my $saveDir_button;
+my $footer_saveDir_button;
+my $footer_name_entry;
+my $syncing_savedir = 0;
 my $scale_label;
 my $scale;
 my $sd;
@@ -2844,7 +2848,51 @@ sub STARTUP {
 	$status->pack_start($delay_status,         FALSE, FALSE, 0);
 	$status->pack_start(Gtk3::HSeparator->new, FALSE, FALSE, 6);
 
+	#directory chooser mirrored from the preferences/profile setting
+	my $footer_saveDir_label = Gtk3::Label->new($d->get("Directory") . ":");
+	$footer_saveDir_button = Gtk3::FileChooserButton->new("Shutter - " . $d->get("Choose folder"), 'select-folder');
+	if (defined $saveDir_button->get_filename) {
+		$footer_saveDir_button->set_filename($saveDir_button->get_filename);
+	}
+	$footer_saveDir_button->set_tooltip_text($d->get("Your screenshots will be saved to this directory"));
+
+	#keep the footer and preferences directory choosers in sync (both ways).
+	#use "file-set" (only fires on an actual user selection) so we never mutate a
+	#chooser's tree model from inside its own async enumeration/selection-changed.
+	$saveDir_button->signal_connect('file-set' => sub {
+		return if $syncing_savedir;
+		$syncing_savedir = 1;
+		my $f = $saveDir_button->get_filename;
+		$footer_saveDir_button->set_filename($f) if defined $f;
+		$syncing_savedir = 0;
+	});
+	$footer_saveDir_button->signal_connect('file-set' => sub {
+		return if $syncing_savedir;
+		$syncing_savedir = 1;
+		my $f = $footer_saveDir_button->get_filename;
+		$saveDir_button->set_filename($f) if defined $f;
+		$syncing_savedir = 0;
+	});
+
+	#per-shot name box: sets the $name wildcard; "sub/dir/name" creates subdirectories
+	my $footer_name_label = Gtk3::Label->new($d->get("Name") . ":");
+	$footer_name_entry = Gtk3::Entry->new;
+	$footer_name_entry->set_width_chars(16);
+	if (defined $settings_xml->{'general'}->{'name'}) {
+		$footer_name_entry->set_text($settings_xml->{'general'}->{'name'});
+	}
+	$footer_name_entry->set_tooltip_text(
+		$d->get("Sets the \$name wildcard for the next screenshot.\nUse \"folder/name\" to save into subdirectories (created automatically) below the directory above."));
+
+	$status->pack_start($footer_saveDir_label,  FALSE, FALSE, 0);
+	$status->pack_start($footer_saveDir_button, FALSE, FALSE, 0);
+	$status->pack_start(Gtk3::HSeparator->new,  FALSE, FALSE, 6);
+	$status->pack_start($footer_name_label,     FALSE, FALSE, 0);
+	$status->pack_start($footer_name_entry,     FALSE, FALSE, 0);
+	$status->pack_start(Gtk3::HSeparator->new,  FALSE, FALSE, 6);
+
 	$vbox->pack_start($status, FALSE, FALSE, 0);
+
 
 	#--------------------------------------
 
@@ -4713,6 +4761,7 @@ sub STARTUP {
 
 		#~ print "Pfad ".$saveDir_button->get_filename()."\n";
 		#~ print "Pfad ".$saveDir_button->get_uri()."\n";
+		$settings{'general'}->{'name'}                          = defined $footer_name_entry ? $footer_name_entry->get_text() : '';
 		$settings{'general'}->{'save_auto'}                     = $save_auto_active->get_active();
 		$settings{'general'}->{'save_ask'}                      = $save_ask_active->get_active();
 		$settings{'general'}->{'save_no'}                       = $save_no_active->get_active();
@@ -4927,6 +4976,19 @@ sub STARTUP {
 
 					utf8::decode $settings_xml->{'general'}->{'folder'};
 					$saveDir_button->set_filename($settings_xml->{'general'}->{'folder'});
+
+					#mirror the loaded profile directory onto the footer chooser
+					if (defined $footer_saveDir_button) {
+						$syncing_savedir = 1;
+						$footer_saveDir_button->set_filename($settings_xml->{'general'}->{'folder'});
+						$syncing_savedir = 0;
+					}
+
+					#restore the footer Name box default
+					if (defined $footer_name_entry && defined $settings_xml->{'general'}->{'name'}) {
+						utf8::decode $settings_xml->{'general'}->{'name'};
+						$footer_name_entry->set_text($settings_xml->{'general'}->{'name'});
+					}
 
 					$save_auto_active->set_active($settings_xml->{'general'}->{'save_auto'});
 					$save_ask_active->set_active($settings_xml->{'general'}->{'save_ask'});
@@ -6140,6 +6202,26 @@ sub STARTUP {
 			$folder = Shutter::App::Directories::get_cache_dir();
 		}
 
+		#per-shot name from the footer box: its basename sets the $name wildcard,
+		#any leading path components become subdirectories below $folder
+		my $name_override = undef;
+		unless ($save_no_active->get_active) {
+			my $footer_name = defined $footer_name_entry ? $footer_name_entry->get_text : '';
+			$footer_name =~ s/^\s+//;
+			$footer_name =~ s/\s+$//;
+			if (length $footer_name) {
+				$footer_name =~ s{\\}{/}g;    #accept backslashes as separators
+				$footer_name =~ s{^/+}{};     #keep the path relative to $folder
+				my $rel_dir = dirname($footer_name);
+				my $base    = basename($footer_name);
+				if (defined $rel_dir && length $rel_dir && $rel_dir ne '.') {
+					$folder = "$folder/$rel_dir";
+					eval { make_path($folder) };
+				}
+				$name_override = $base if length $base;
+			}
+		}
+
 		#screenshot(pixbuf) and screenshot name
 		my $screenshot       = undef;
 		my $screenshooter    = undef;
@@ -6561,7 +6643,7 @@ sub STARTUP {
 				$filename_value =~ s/(\/|\#)/-/g;
 
 				#..replace wildcards by values
-				$filename_value = &fct_parse_filename_wildcards($filename_value, $screenshooter, $screenshot);
+				$filename_value = &fct_parse_filename_wildcards($filename_value, $screenshooter, $screenshot, $name_override);
 
 				#...and get next filename
 				$giofile = fct_get_next_filename($filename_value, $folder, $filetype_value);
@@ -7977,7 +8059,7 @@ sub STARTUP {
 	}
 
 	sub fct_parse_filename_wildcards {
-		my ($filename_value, $screenshooter, $screenshot) = @_;
+		my ($filename_value, $screenshooter, $screenshot, $name_override) = @_;
 
 		my $screenshot_name = $filename_value;
 
@@ -8003,7 +8085,18 @@ sub STARTUP {
 
 		#set name
 		#e.g. window or workspace name
-		if ($x11_supported) {
+		if (defined $name_override && length $name_override) {
+
+			#name supplied through the footer Name box (works on X11 and Wayland)
+			my $action_name = $name_override;
+			utf8::decode $action_name;
+			$action_name     =~ s/(\/|\#|\>|\<|\%|\*)/-/g;
+			$screenshot_name =~ s/\$name/$action_name/g;
+
+			$action_name     =~ s/\ //g;
+			$screenshot_name =~ s/\$nb_name/$action_name/g;
+
+		} elsif ($x11_supported) {
 			if (my $action_name = $screenshooter->get_action_name) {
 				utf8::decode $action_name;
 				$action_name     =~ s/(\/|\#|\>|\<|\%|\*)/-/g;
