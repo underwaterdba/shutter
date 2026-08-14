@@ -262,12 +262,25 @@ sub show {
 	$self->{_drawing_window}->set_modal(1);
 	$self->{_drawing_window}->signal_connect('delete_event', sub { return $self->quit(TRUE) });
 
+	#close the editor with the Esc key
+	$self->{_drawing_window}->signal_connect('key-press-event', sub {
+		my ($widget, $ev) = @_;
+		if ($ev->keyval == Gtk3::Gdk::keyval_from_name('Escape')) {
+			$self->quit(TRUE);
+			return TRUE;
+		}
+		return FALSE;
+	});
+
 	#adjust toplevel window size
 	if ($self->{_root}->{w} > 640 && $self->{_root}->{h} > 480) {
 		$self->{_drawing_window}->set_default_size(640, 480);
 	} else {
 		$self->{_drawing_window}->set_default_size($self->{_root}->{w} - 100, $self->{_root}->{h} - 100);
 	}
+
+	#open the editor maximized by default
+	$self->{_drawing_window}->maximize;
 
 	#dialogs, thumbnail generator and pixbuf loader
 	$self->{_dialogs} = Shutter::App::SimpleDialogs->new($self->{_drawing_window});
@@ -478,6 +491,11 @@ sub show {
 	$self->{_scrolled_window}->add($self->{_canvas});
 	$self->{_hscroll_hid} = $self->{_scrolled_window}->get_hscrollbar->signal_connect('value-changed' => sub { $self->adjust_rulers });
 	$self->{_vscroll_hid} = $self->{_scrolled_window}->get_vscrollbar->signal_connect('value-changed' => sub { $self->adjust_rulers });
+
+	#fit the whole image on the canvas until the user zooms manually; this also
+	#re-fits while the window settles into its maximized size on startup
+	$self->{_user_zoomed} = FALSE;
+	$self->{_scrolled_window}->signal_connect('size-allocate' => sub { $self->zoom_fit_cb unless $self->{_user_zoomed} });
 
 	#vruler
 	#$self->{_vruler} = Gtk3::VRuler->new;
@@ -1221,6 +1239,7 @@ sub change_drawing_tool_cb {
 sub zoom_in_cb {
 	my $self = shift;
 
+	$self->{_user_zoomed} = TRUE;
 	if ($self->{_current_mode_descr} ne "crop") {
 		$self->{_canvas}->set_scale($self->{_canvas}->get_scale + 0.2);
 
@@ -1235,6 +1254,7 @@ sub zoom_in_cb {
 sub zoom_out_cb {
 	my $self = shift;
 
+	$self->{_user_zoomed} = TRUE;
 	if ($self->{_current_mode_descr} ne "crop") {
 		my $new_scale = $self->{_canvas}->get_scale - 0.2;
 		if ($new_scale < 0.2) {
@@ -1254,6 +1274,7 @@ sub zoom_out_cb {
 sub zoom_normal_cb {
 	my $self = shift;
 
+	$self->{_user_zoomed} = TRUE;
 	if ($self->{_current_mode_descr} ne "crop") {
 		$self->{_canvas}->set_scale(1);
 
@@ -1262,6 +1283,34 @@ sub zoom_normal_cb {
 		$self->{_view}->set_zoom(1);
 	}
 
+	return TRUE;
+}
+
+#fit the whole drawing pixbuf within the visible canvas area
+sub zoom_fit_cb {
+	my $self = shift;
+
+	return TRUE if defined $self->{_current_mode_descr} && $self->{_current_mode_descr} eq "crop";
+	return TRUE unless $self->{_canvas} && $self->{_drawing_pixbuf};
+
+	my $iw = $self->{_drawing_pixbuf}->get_width;
+	my $ih = $self->{_drawing_pixbuf}->get_height;
+	return TRUE unless $iw && $ih;
+
+	#leave a small margin so the image is not flush against the edges
+	my $vw = $self->{_scrolled_window}->get_allocated_width - 8;
+	my $vh = $self->{_scrolled_window}->get_allocated_height - 8;
+	return TRUE if $vw < 1 || $vh < 1;
+
+	my $scale = $vw / $iw;
+	my $sh    = $vh / $ih;
+	$scale = $sh if $sh < $scale;
+
+	#never enlarge beyond 1:1, and keep a sane lower bound
+	$scale = 1    if $scale > 1;
+	$scale = 0.05 if $scale < 0.05;
+
+	$self->{_canvas}->set_scale($scale);
 	return TRUE;
 }
 
